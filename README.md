@@ -48,15 +48,15 @@ This extension is inspired by **Mastra** memory patterns and adapts them for Pi 
 ```mermaid
 flowchart TD
   A[Conversation turns] --> B[Pending segments buffer]
-  B --> C[/om-observe or auto observe]
-  C --> D[Observer model compresses -> observations]
-  D --> E[State update: observations/currentTask/suggestedResponse]
+  B --> C[Observe trigger: om-observe or auto]
+  C --> D[Observer model compresses to observations]
+  D --> E[State updated with observations, currentTask, suggestedResponse]
   E --> F{memoryInjectionMode}
   F -->|all| G[Inject full observations into context]
-  F -->|core_relevant| H[Inject core memory + relevant subset]
+  F -->|core_relevant| H[Inject core memory and relevant subset]
   G --> I[LLM call]
   H --> I[LLM call]
-  E --> J[/compact uses OM summary]
+  E --> J[Compaction uses OM summary]
 ```
 
 ---
