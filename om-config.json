@@ -8,5 +8,9 @@
   "memoryInjectionMode": "all",
   "coreMemoryMaxTokens": 500,
   "relevantObservationMaxItems": 20,
-  "relevantObservationMaxTokens": 1400
+  "relevantObservationMaxTokens": 1400,
+  "enableReflection": true,
+  "reflectEveryNObservations": 3,
+  "reflectWhenObservationTokensOver": 3000,
+  "reflectBeforeCompaction": true
 }

@@ -43,20 +43,39 @@ This extension is inspired by **Mastra** memory patterns and adapts them for Pi 
 
 ---
 
+## Reflection status
+
+Reflection is now wired into runtime behavior:
+
+- Reflection rewrites the **same canonical memory fields** used for injection and compaction:
+  - `observations`
+  - `currentTask`
+  - `suggestedResponse`
+- Auto reflection can run after observe based on thresholds.
+- Aggressive reflection can run before compaction.
+- Manual reflection is available via `/om-reflect`.
+
+---
+
 ## High-level flow (graph)
 
 ```mermaid
 flowchart TD
   A[Conversation turns] --> B[Pending segments buffer]
   B --> C[Observe trigger: om-observe or auto]
-  C --> D[Observer model compresses to observations]
-  D --> E[State updated with observations, currentTask, suggestedResponse]
-  E --> F{memoryInjectionMode}
-  F -->|all| G[Inject full observations into context]
-  F -->|core_relevant| H[Inject core memory and relevant subset]
-  G --> I[LLM call]
-  H --> I[LLM call]
-  E --> J[Compaction uses OM summary]
+  C --> D[Observer model compresses transcript]
+  D --> E[Merge into observations state]
+  E --> F{Reflect trigger}
+  F -->|periodic threshold| G[Reflector compacts observations]
+  F -->|pre-compaction enabled| G
+  F -->|no trigger| H[Use current observations]
+  G --> H
+  H --> I{memoryInjectionMode}
+  I -->|all| J[Inject full observations]
+  I -->|core_relevant| K[Inject core plus relevant]
+  J --> L[LLM call]
+  K --> L
+  H --> M[Compaction summary from observations]
 ```
 
 ---
@@ -82,6 +101,12 @@ flowchart TD
 - `/om-observe --no-compact`
   - Force observe without triggering compaction.
 
+- `/om-reflect`
+  - Force reflection now using current observations.
+
+- `/om-reflect --aggressive`
+  - Force more aggressive reflection compression.
+
 - `/om-observations`
   - Prints current compressed observations + task/next-step fields.
 
@@ -103,7 +128,11 @@ flowchart TD
   "memoryInjectionMode": "all",
   "coreMemoryMaxTokens": 500,
   "relevantObservationMaxItems": 20,
-  "relevantObservationMaxTokens": 1400
+  "relevantObservationMaxTokens": 1400,
+  "enableReflection": true,
+  "reflectEveryNObservations": 3,
+  "reflectWhenObservationTokensOver": 3000,
+  "reflectBeforeCompaction": true
 }
 ```
 
@@ -148,6 +177,24 @@ flowchart TD
   - **Use true when:** you want observe+compact as one operation.
   - **Use false when:** you want to inspect observations before compaction.
 
+- `enableReflection`
+  - **What:** enables reflector stage.
+  - **Use true when:** you want periodic consolidation.
+
+- `reflectEveryNObservations`
+  - **What:** periodic trigger after this many successful observe runs.
+  - **Lower:** more frequent cleanup, higher model usage.
+  - **Higher:** less overhead, more raw observation growth.
+
+- `reflectWhenObservationTokensOver`
+  - **What:** token-trigger threshold for reflection.
+  - **Lower:** reflection runs sooner.
+  - **Higher:** reflection waits for larger memory blocks.
+
+- `reflectBeforeCompaction`
+  - **What:** runs aggressive reflection before compaction summary generation.
+  - **Use true when:** compaction boundaries should snapshot best-possible memory.
+
 #### 4) Injection strategy
 
 - `memoryInjectionMode`
@@ -179,17 +226,19 @@ flowchart TD
 ## Config tradeoff graph
 
 ```mermaid
-quadrantChart
-    title Injection mode tradeoff
-    x-axis Lower continuity --> Higher continuity
-    y-axis Lower token cost --> Higher token cost
-    quadrant-1 High continuity / High cost
-    quadrant-2 Lower continuity / High cost
-    quadrant-3 Lower continuity / Lower cost
-    quadrant-4 Higher continuity / Lower cost
-    "all mode": [0.88, 0.82]
-    "core_relevant (balanced)": [0.72, 0.42]
-    "core_relevant (aggressive caps)": [0.55, 0.25]
+flowchart TD
+  A[Injection mode tradeoff] --> B[all mode]
+  A --> C[core_relevant balanced]
+  A --> D[core_relevant aggressive caps]
+
+  B --> B1[Continuity: high]
+  B --> B2[Token cost: high]
+
+  C --> C1[Continuity: medium-high]
+  C --> C2[Token cost: medium]
+
+  D --> D1[Continuity: medium]
+  D --> D2[Token cost: low]
 ```
 
 ---

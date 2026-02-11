@@ -96,6 +96,10 @@ type OmConfig = {
 	coreMemoryMaxTokens: number;
 	relevantObservationMaxItems: number;
 	relevantObservationMaxTokens: number;
+	enableReflection: boolean;
+	reflectEveryNObservations: number;
+	reflectWhenObservationTokensOver: number;
+	reflectBeforeCompaction: boolean;
 };
 
 const DEFAULT_OM_CONFIG: OmConfig = {
@@ -109,6 +113,10 @@ const DEFAULT_OM_CONFIG: OmConfig = {
 	coreMemoryMaxTokens: 500,
 	relevantObservationMaxItems: 20,
 	relevantObservationMaxTokens: 1400,
+	enableReflection: true,
+	reflectEveryNObservations: 3,
+	reflectWhenObservationTokensOver: 3000,
+	reflectBeforeCompaction: true,
 };
 
 let omConfig: OmConfig = { ...DEFAULT_OM_CONFIG };
@@ -150,6 +158,19 @@ function normalizeOmConfig(raw: any): OmConfig {
 		coreMemoryMaxTokens: coerceNumber(raw?.coreMemoryMaxTokens, DEFAULT_OM_CONFIG.coreMemoryMaxTokens),
 		relevantObservationMaxItems: coerceNumber(raw?.relevantObservationMaxItems, DEFAULT_OM_CONFIG.relevantObservationMaxItems),
 		relevantObservationMaxTokens: coerceNumber(raw?.relevantObservationMaxTokens, DEFAULT_OM_CONFIG.relevantObservationMaxTokens),
+		enableReflection:
+			typeof raw?.enableReflection === "boolean"
+				? raw.enableReflection
+				: DEFAULT_OM_CONFIG.enableReflection,
+		reflectEveryNObservations: coerceNumber(raw?.reflectEveryNObservations, DEFAULT_OM_CONFIG.reflectEveryNObservations),
+		reflectWhenObservationTokensOver: coerceNumber(
+			raw?.reflectWhenObservationTokensOver,
+			DEFAULT_OM_CONFIG.reflectWhenObservationTokensOver,
+		),
+		reflectBeforeCompaction:
+			typeof raw?.reflectBeforeCompaction === "boolean"
+				? raw.reflectBeforeCompaction
+				: DEFAULT_OM_CONFIG.reflectBeforeCompaction,
 	};
 }
 
@@ -860,7 +881,7 @@ export default function (pi: ExtensionAPI) {
 						text = typeof message.content === "string" ? message.content.trim() : "";
 					}
 				}
-				
+
 				if (!text && Array.isArray(response?.content)) {
 					text = response.content
 						.filter((c: any) => c?.type === "text")
@@ -868,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 						.join("\n")
 						.trim();
 				}
-				
+
 				if (!text && typeof response?.content === "string") {
 					text = response.content.trim();
 				}
@@ -882,7 +903,79 @@ export default function (pi: ExtensionAPI) {
 		return parsed;
 	};
 
-	const observeNow = async (ctx: ExtensionContext): Promise<boolean> => {
+	const shouldRunPeriodicReflection = (): boolean => {
+		if (!omConfig.enableReflection) return false;
+		if (!state.observations.trim()) return false;
+
+		const everyN = Math.max(1, Math.floor(omConfig.reflectEveryNObservations || 1));
+		const tokenThreshold = Math.max(1, Math.floor(omConfig.reflectWhenObservationTokensOver || 1));
+		const byObservationRuns = state.observationRuns > 0 && state.observationRuns % everyN === 0;
+		const byTokenThreshold = state.observationTokens >= tokenThreshold;
+		return byObservationRuns || byTokenThreshold;
+	};
+
+	const reflectNow = async (
+		ctx: ExtensionContext,
+		opts: { aggressive?: boolean; reason?: string; silentIfSkipped?: boolean } = {},
+	): Promise<boolean> => {
+		const aggressive = !!opts.aggressive;
+		const reason = opts.reason || "manual";
+		const silentIfSkipped = !!opts.silentIfSkipped;
+
+		if (!omConfig.enableReflection) {
+			if (!silentIfSkipped) ctx.ui.notify("OM: Reflection disabled by config.", "warning");
+			return false;
+		}
+		if (!state.observations.trim()) {
+			if (!silentIfSkipped) ctx.ui.notify("OM: No observations to reflect.", "warning");
+			return false;
+		}
+		if (state.isBufferingReflection) {
+			if (!silentIfSkipped) ctx.ui.notify("OM: Reflection already running.", "warning");
+			return false;
+		}
+
+		state.isBufferingReflection = true;
+		updateStatus(ctx);
+		try {
+			const beforeObservations = state.observations;
+			const beforeTokens = state.observationTokens;
+			const parsed = await runReflectorCall(ctx, beforeObservations, aggressive);
+			if (!parsed?.observations?.trim()) {
+				if (!silentIfSkipped) ctx.ui.notify("OM: Reflection parse failed. Keeping existing observations.", "warning");
+				return false;
+			}
+
+			state.observations = mergeObservationItems("", parsed.observations);
+			state.observationTokens = roughTextTokenizer(state.observations);
+			if (parsed.currentTask) state.currentTask = parsed.currentTask;
+			if (parsed.suggestedResponse) state.suggestedResponse = parsed.suggestedResponse;
+			state.reflectionRuns += 1;
+			state.reflections.unshift({
+				at: new Date().toISOString(),
+				beforeTokens,
+				afterTokens: state.observationTokens,
+				preview: trimPreview(`${reason}${aggressive ? " (aggressive)" : ""}: ${state.observations}`, 320),
+			});
+			state.reflections = state.reflections.slice(0, 15);
+
+			persistState(ctx);
+			updateStatus(ctx);
+			ctx.ui.notify(
+				`OM: Reflection complete (${reason}${aggressive ? ", aggressive" : ""}). ${beforeTokens} -> ${state.observationTokens} tokens.`,
+				"info",
+			);
+			return true;
+		} finally {
+			state.isBufferingReflection = false;
+			updateStatus(ctx);
+		}
+	};
+
+	const observeNow = async (
+		ctx: ExtensionContext,
+		opts: { triggerAutoReflect?: boolean } = {},
+	): Promise<boolean> => {
 		if (!state.pendingSegments.length) return false;
 		const transcript = buildTranscriptFromSegments(state.pendingSegments);
 		const tokens = state.pendingTokens;
@@ -898,6 +991,12 @@ export default function (pi: ExtensionAPI) {
 		state.pendingSegments = [];
 		state.bufferedChunks = [];
 		recomputePendingCounters(state);
+
+		const triggerAutoReflect = opts.triggerAutoReflect !== false;
+		if (triggerAutoReflect && shouldRunPeriodicReflection()) {
+			await reflectNow(ctx, { reason: "auto-periodic", silentIfSkipped: true });
+		}
+
 		return true;
 	};
 
@@ -948,11 +1047,22 @@ export default function (pi: ExtensionAPI) {
 			recomputePendingCounters(state);
 
 			// Trigger observation before compaction
-			const observed = await observeNow(ctx);
+			const observed = await observeNow(ctx, { triggerAutoReflect: false });
 			if (observed) {
 				persistState(ctx);
 				updateStatus(ctx);
 				console.error("[om:compact] Observed messages before compaction");
+
+				if (omConfig.reflectBeforeCompaction && omConfig.enableReflection) {
+					const reflected = await reflectNow(ctx, {
+						aggressive: true,
+						reason: "before-compaction",
+						silentIfSkipped: true,
+					});
+					if (reflected) {
+						console.error("[om:compact] Reflected observations before compaction");
+					}
+				}
 			}
 		}
 
@@ -1021,6 +1131,8 @@ export default function (pi: ExtensionAPI) {
 				`Gemini CLI: ${hasGeminiCli ? `primary (${omConfig.geminiCliModel})` : "not found"}`,
 				`Observations: ${state.observationRuns}`,
 				`Reflections: ${state.reflectionRuns}`,
+				`Reflection enabled: ${omConfig.enableReflection}`,
+				`Reflection running: ${state.isBufferingReflection ? "yes" : "no"}`,
 				`Observation tokens: ${state.observationTokens.toLocaleString()}`,
 				`Pending tokens: ${state.pendingTokens.toLocaleString()}`,
 			].join("\n");
@@ -1070,6 +1182,10 @@ export default function (pi: ExtensionAPI) {
 				`coreMemoryMaxTokens: ${omConfig.coreMemoryMaxTokens}`,
 				`relevantObservationMaxItems: ${omConfig.relevantObservationMaxItems}`,
 				`relevantObservationMaxTokens: ${omConfig.relevantObservationMaxTokens}`,
+				`enableReflection: ${omConfig.enableReflection}`,
+				`reflectEveryNObservations: ${omConfig.reflectEveryNObservations}`,
+				`reflectWhenObservationTokensOver: ${omConfig.reflectWhenObservationTokensOver}`,
+				`reflectBeforeCompaction: ${omConfig.reflectBeforeCompaction}`,
 			].join("\n");
 			ctx.ui.notify(lines, "info");
 		},
@@ -1111,6 +1227,19 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	pi.registerCommand("om-reflect", {
+		description: "Force reflection now (usage: /om-reflect [--aggressive])",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const aggressive = args.includes("--aggressive");
+			const ok = await reflectNow(ctx, {
+				aggressive,
+				reason: "manual-command",
+				silentIfSkipped: false,
+			});
+			if (!ok) return;
+		},
+	});
 
 	pi.registerCommand("om-observations", {
 		description: "Show compressed observations",
