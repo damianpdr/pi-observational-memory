@@ -1,0 +1,12 @@
+{
+  "recentTurnBudgetTokens": 12000,
+  "maxObservationItems": 1200,
+  "maxObserverTranscriptChars": 200000,
+  "maxReflectorObservationsChars": 240000,
+  "geminiCliModel": "gemini-2.5-flash",
+  "forceObserveAutoCompact": true,
+  "memoryInjectionMode": "all",
+  "coreMemoryMaxTokens": 500,
+  "relevantObservationMaxItems": 20,
+  "relevantObservationMaxTokens": 1400
+}
