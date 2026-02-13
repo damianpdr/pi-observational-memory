@@ -100,6 +100,8 @@ type OmConfig = {
 	reflectEveryNObservations: number;
 	reflectWhenObservationTokensOver: number;
 	reflectBeforeCompaction: boolean;
+	/** Auto-observe when pending tokens exceed this threshold (0 = disabled). Default: 8000 */
+	autoObservePendingTokenThreshold: number;
 };
 
 const DEFAULT_OM_CONFIG: OmConfig = {
@@ -117,6 +119,7 @@ const DEFAULT_OM_CONFIG: OmConfig = {
 	reflectEveryNObservations: 3,
 	reflectWhenObservationTokensOver: 3000,
 	reflectBeforeCompaction: true,
+	autoObservePendingTokenThreshold: 8_000,
 };
 
 let omConfig: OmConfig = { ...DEFAULT_OM_CONFIG };
@@ -171,6 +174,11 @@ function normalizeOmConfig(raw: any): OmConfig {
 			typeof raw?.reflectBeforeCompaction === "boolean"
 				? raw.reflectBeforeCompaction
 				: DEFAULT_OM_CONFIG.reflectBeforeCompaction,
+		autoObservePendingTokenThreshold: coerceNumber(
+			raw?.autoObservePendingTokenThreshold,
+			DEFAULT_OM_CONFIG.autoObservePendingTokenThreshold,
+			0,
+		),
 	};
 }
 
@@ -587,22 +595,45 @@ function buildReflectorPrompt(observations: string, aggressive = false): string 
 		? observations.slice(0, omConfig.maxReflectorObservationsChars) + "\n\n[...truncated...]"
 		: observations;
 
-	return `You are a Reflector agent for coding memory.
+	return `You are the Reflector — the memory consciousness of an AI coding assistant.
 
-Condense the observation log while preserving all critical continuity.
+Your reflection will REPLACE ALL existing observations entirely. This is not an addendum — the original observations will be deleted after you produce your output. Your reflection becomes the ONLY memory the assistant has.
 
-Compression goals:
-- Keep decisions, current state, blockers, and next steps.
-- Merge repeated debugging/tool activity.
-- Keep names, paths, commands, and concrete facts.
-${aggressive ? "- Use aggressive compression if needed." : "- Use moderate compression."}
+CRITICAL: Any information you do not include in your output will be permanently and irrecoverably forgotten. Do not leave anything important out.
+
+Your job:
+1. Re-organize and streamline the observations into a coherent, condensed memory
+2. Draw connections between related observations
+3. Merge repeated items (e.g. "agent called view tool 5 times on file X" instead of 5 separate entries)
+4. Identify if work got off track and note how to get back on track
+5. Condense older observations more aggressively, retain more detail for recent ones
+
+Preserve:
+- ALL key decisions, constraints, blockers, and outcomes
+- User preferences and assertions (user is the authority on their own statements)
+- Exact technical anchors: file paths, API names, commands, identifiers, line references
+- Temporal context: dates, ordering of events, what happened when
+- Current state of work and what remains to be done
+
+${aggressive
+		? `AGGRESSIVE COMPRESSION REQUIRED:
+- Heavily condense older observations into high-level summaries
+- Retain fine details only for recent context
+- Combine related items aggressively
+- Target 40-60% size reduction from input
+- Your detail level should be ~6/10`
+		: `MODERATE COMPRESSION:
+- Condense repeated and redundant items
+- Keep important specifics intact
+- Target 20-40% size reduction from input
+- Your detail level should be ~8/10`}
 
 Output strictly as:
 <observations>...</observations>
 <current-task>...</current-task>
 <suggested-response>...</suggested-response>
 
-Observations:
+Observations to reflect on:
 ${truncatedObs}`;
 }
 
@@ -719,14 +750,22 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const updateStatus = (ctx: ExtensionContext) => {
-		const status = [
-			`OM ${STORAGE_SCOPE}`,
+		const fmtPending = (n: number) => (n < 1000 ? `${n}` : `${(n / 1000).toFixed(1)}k`);
+		const parts: string[] = [
+			"📦 OM",
+			`pending:${fmtPending(state.pendingTokens)}`,
 			`obs:${state.observationRuns}`,
-			`refl:${state.reflectionRuns}`,
-			`pending:${state.pendingTokens.toLocaleString()}`,
-			`buffered:${state.bufferedChunks.length}`,
-		].join(" ");
-		ctx.ui.setStatus("observational-memory", status);
+			`rfl:${state.reflectionRuns}`,
+		];
+
+		if (state.isBufferingReflection) {
+			parts.push("🔄");
+		}
+		if (state.isBufferingObservation) {
+			parts.push("👁️");
+		}
+
+		ctx.ui.setStatus("observational-memory", parts.join(" | "));
 	};
 
 	const loadState = (ctx: ExtensionContext) => {
@@ -768,7 +807,6 @@ export default function (pi: ExtensionAPI) {
 				text = await callGeminiCli(buildObserverPrompt(state.observations, transcript), signal) || "";
 				usedGeminiCli = true;
 			} catch (err) {
-				console.error("[om:debug] Gemini CLI error:", err);
 				ctx.ui.notify(`OM: Gemini CLI failed, trying API...`, "warning");
 			}
 		}
@@ -821,12 +859,9 @@ export default function (pi: ExtensionAPI) {
 		}
 		warnedMissingModel = false;
 
-		console.error("[om:debug] Extracted text:", text.length, "chars", usedGeminiCli ? "(Gemini CLI)" : "(API)");
-
 		const parsed = parseOmSections(text);
 		if (!parsed.observations.trim()) {
 			lastObserverParseFailurePreview = trimPreview(text || "(empty)", 320);
-			console.error("[om:debug] Parse failed:", lastObserverParseFailurePreview);
 			return undefined;
 		}
 
@@ -852,7 +887,7 @@ export default function (pi: ExtensionAPI) {
 				text = await callGeminiCli(buildReflectorPrompt(observations, aggressive), signal) || "";
 				usedGeminiCli = true;
 			} catch (err) {
-				console.error("[om:debug] Gemini CLI error:", err);
+				// Gemini CLI failed, fall through to API
 			}
 		}
 
@@ -895,8 +930,6 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
-
-		console.error("[om:debug] Reflector text:", text.length, "chars", usedGeminiCli ? "(Gemini CLI)" : "(API)");
 
 		const parsed = parseOmSections(text);
 		if (!parsed.observations.trim()) return undefined;
@@ -1022,6 +1055,18 @@ export default function (pi: ExtensionAPI) {
 		};
 		state.pendingSegments.push(segment);
 		recomputePendingCounters(state);
+
+		// Auto-observe when pending tokens exceed threshold (fixes dead-lock on large context windows
+		// where compaction never triggers because the context hook trims messages before pi sees high usage)
+		const threshold = omConfig.autoObservePendingTokenThreshold;
+		if (threshold > 0 && state.pendingTokens >= threshold && state.pendingSegments.length > 0) {
+			ctx.ui.notify(`OM: Auto-observing (pending ${state.pendingTokens.toLocaleString()} tokens >= ${threshold.toLocaleString()} threshold)`, "info");
+			const observed = await observeNow(ctx, { triggerAutoReflect: true });
+			if (observed) {
+				ctx.ui.notify(`OM: Auto-observation complete. Observations: ${state.observationRuns}, tokens: ${state.observationTokens.toLocaleString()}`, "info");
+			}
+		}
+
 		persistState(ctx);
 		updateStatus(ctx);
 	});
@@ -1051,17 +1096,13 @@ export default function (pi: ExtensionAPI) {
 			if (observed) {
 				persistState(ctx);
 				updateStatus(ctx);
-				console.error("[om:compact] Observed messages before compaction");
 
 				if (omConfig.reflectBeforeCompaction && omConfig.enableReflection) {
-					const reflected = await reflectNow(ctx, {
+					await reflectNow(ctx, {
 						aggressive: true,
 						reason: "before-compaction",
 						silentIfSkipped: true,
 					});
-					if (reflected) {
-						console.error("[om:compact] Reflected observations before compaction");
-					}
 				}
 			}
 		}
@@ -1083,7 +1124,7 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("context", async (event, ctx) => {
+	pi.on("context", (event, ctx) => {
 		const modelHint = "";
 		const systemMessages = event.messages.filter((m: any) => m?.role === "system");
 		const nonSystemMessages = event.messages.filter((m: any) => m?.role !== "system");
@@ -1112,9 +1153,6 @@ export default function (pi: ExtensionAPI) {
 			(sum, m: any) => sum + roughTextTokenizer(typeof m.content === "string" ? m.content : JSON.stringify(m.content)),
 			0,
 		);
-
-		console.error(`[om:context] Input: ${event.messages.length} messages → Output: ${finalMessages.length} messages (~${totalTokens} tokens)`);
-		console.error(`[om:context] Observations: ${state.observationTokens} tokens, Recent: ${recentMessages.length} messages`);
 
 		return { messages: finalMessages };
 	});
@@ -1231,6 +1269,19 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("om-reflect", {
 		description: "Force reflection now (usage: /om-reflect [--aggressive])",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			// Mastra pattern: Observer always runs before Reflector.
+			// Process any pending segments into observations first so they get
+			// included in the reflection. Without this, pending segments survive
+			// the reflection and later re-create observations that were just condensed.
+			if (state.pendingSegments.length > 0) {
+				ctx.ui.notify(`OM: Observing ${state.pendingSegments.length} pending segments before reflection...`, "info");
+				const observed = await observeNow(ctx, { triggerAutoReflect: false });
+				if (observed) {
+					persistState(ctx);
+					updateStatus(ctx);
+				}
+			}
+
 			const aggressive = args.includes("--aggressive");
 			const ok = await reflectNow(ctx, {
 				aggressive,
