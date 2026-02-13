@@ -43,17 +43,16 @@ This extension is inspired by **Mastra** memory patterns and adapts them for Pi 
 
 ---
 
-## Reflection status
+## Reflection
 
-Reflection is now wired into runtime behavior:
+Following [Mastra's Observational Memory](https://mastra.ai/research/observational-memory) design, the Reflector condenses observations into a single consolidated memory block that **replaces** the original observations entirely. The reflected output becomes the assistant's only memory — anything omitted is permanently forgotten.
 
-- Reflection rewrites the **same canonical memory fields** used for injection and compaction:
-  - `observations`
-  - `currentTask`
-  - `suggestedResponse`
-- Auto reflection can run after observe based on thresholds.
+Key behavior:
+- `/om-reflect` **observes pending segments first** (Mastra pattern: Observer always runs before Reflector), then reflects on the full observation set.
+- Reflection rewrites the **same canonical memory fields** used for injection and compaction: `observations`, `currentTask`, `suggestedResponse`.
+- Auto reflection can trigger after observe based on thresholds.
 - Aggressive reflection can run before compaction.
-- Manual reflection is available via `/om-reflect`.
+- The reflector prompt gives explicit compression targets (20-40% moderate, 40-60% aggressive) and instructs the model to condense older items more while keeping recent details.
 
 ---
 
@@ -66,10 +65,12 @@ flowchart TD
   C --> D[Observer model compresses transcript]
   D --> E[Merge into observations state]
   E --> F{Reflect trigger}
-  F -->|periodic threshold| G[Reflector compacts observations]
-  F -->|pre-compaction enabled| G
+  F -->|periodic threshold| F1[Observe pending segments first]
+  F -->|manual /om-reflect| F1
+  F -->|pre-compaction enabled| F1
+  F1 --> G[Reflector condenses observations]
   F -->|no trigger| H[Use current observations]
-  G --> H
+  G -->|replaces observations| H
   H --> I{memoryInjectionMode}
   I -->|all| J[Inject full observations]
   I -->|core_relevant| K[Inject core plus relevant]
@@ -102,10 +103,11 @@ flowchart TD
   - Force observe without triggering compaction.
 
 - `/om-reflect`
-  - Force reflection now using current observations.
+  - Observes any pending segments first, then reflects on all observations.
+  - Reflection output **replaces** all existing observations.
 
 - `/om-reflect --aggressive`
-  - Force more aggressive reflection compression.
+  - Same as above but with aggressive compression (targets 40-60% size reduction).
 
 - `/om-observations`
   - Prints current compressed observations + task/next-step fields.
@@ -132,7 +134,8 @@ flowchart TD
   "enableReflection": true,
   "reflectEveryNObservations": 3,
   "reflectWhenObservationTokensOver": 3000,
-  "reflectBeforeCompaction": true
+  "reflectBeforeCompaction": true,
+  "autoObservePendingTokenThreshold": 8000
 }
 ```
 
@@ -194,6 +197,13 @@ flowchart TD
 - `reflectBeforeCompaction`
   - **What:** runs aggressive reflection before compaction summary generation.
   - **Use true when:** compaction boundaries should snapshot best-possible memory.
+
+- `autoObservePendingTokenThreshold`
+  - **What:** auto-triggers observation when pending segment tokens exceed this value. Set to `0` to disable.
+  - **Default:** `8000`.
+  - **Why:** prevents deadlock on large context windows where compaction never triggers because the context hook trims messages before Pi sees high usage.
+  - **Lower:** more frequent auto-observations, keeps observations fresher.
+  - **Higher:** fewer auto-observation runs, larger batches per observation.
 
 #### 4) Injection strategy
 
@@ -285,6 +295,7 @@ flowchart TD
 - `PI_OM_SCOPE=thread|resource`
 - `PI_OM_SQLITE=1`
 - `PI_OM_SQLITE_PATH=/absolute/path/to/om.sqlite`
+- `PI_OM_GEMINI_MODEL=gemini-2.5-flash` (override default Gemini CLI model)
 
 Notes:
 - `resource` scope auto-enables SQLite.
