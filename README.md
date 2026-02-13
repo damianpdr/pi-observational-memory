@@ -43,16 +43,120 @@ This extension is inspired by **Mastra** memory patterns and adapts them for Pi 
 
 ---
 
-## Reflection
+## Mastra-aligned features
 
-Following [Mastra's Observational Memory](https://mastra.ai/research/observational-memory) design, the Reflector condenses observations into a single consolidated memory block that **replaces** the original observations entirely. The reflected output becomes the assistant's only memory — anything omitted is permanently forgotten.
+### Rich Observer prompt
 
-Key behavior:
-- `/om-reflect` **observes pending segments first** (Mastra pattern: Observer always runs before Reflector), then reflects on the full observation set.
-- Reflection rewrites the **same canonical memory fields** used for injection and compaction: `observations`, `currentTask`, `suggestedResponse`.
-- Auto reflection can trigger after observe based on thresholds.
+The observer uses a comprehensive extraction prompt modeled on Mastra's memory system:
+
+- **User assertion vs question distinction**: "I prefer tabs" → assertion (🔴); "Can you refactor?" → question (🟡)
+- **State change tracking**: "I switched from REST to GraphQL" → supersedes previous info
+- **Temporal anchoring**: Each observation has a creation timestamp + optional referenced date
+- **Technical detail preservation**: Exact file paths, line numbers, error messages, commands
+- **Tool call sequence grouping**: Related tool calls grouped with indentation
+- **Architecture decision capture**: Decision + reasoning preserved together
+- **Unusual phrasing preservation**: User's exact words quoted when non-standard
+
+### Priority emoji system (🔴🟡🟢)
+
+Observations are tagged with priority levels:
+
+| Emoji | Priority | Examples |
+|-------|----------|----------|
+| 🔴 | High | User preferences, goals achieved, critical decisions, blockers |
+| 🟡 | Medium | Project details, tool results, file changes, implementation progress |
+| 🟢 | Low | Minor details, uncertain observations, exploratory notes |
+
+During context injection, 🟡 and 🟢 emojis are stripped to save tokens (observations still retained, just without emoji prefix). 🔴 items keep their marker.
+
+### Date-grouped output format
+
+Observer output is structured by date with 24-hour timestamps:
+
+```
+Date: Feb 12, 2026
+* 🔴 (14:30) User stated project uses Next.js 15 with App Router
+* 🟡 (14:45) Agent implemented fuzzy matching in src/utils/searchUtils.ts
+  * -> added Levenshtein distance calculation
+  * -> integrated with existing SearchBar component
+
+Date: Feb 13, 2026
+* 🟡 (09:15) Continued search feature - added result highlighting
+* 🔴 (09:30) User found bug: search fails on special characters
+```
+
+### Relative time annotations
+
+When observations are injected into context, date headers get relative time annotations:
+
+```
+Date: Feb 12, 2026 (yesterday)
+...
+[1 week later]
+Date: Feb 19, 2026 (today)
+```
+
+Features:
+- `formatRelativeTime()` — "2 days ago", "yesterday", "today", "in 3 days"
+- `formatGapBetweenDates()` — "[3 days later]", "[2 weeks later]" gap markers between date groups
+- `expandInlineEstimatedDates()` — inline references like `(meaning Feb 10)` become `(meaning Feb 10 - 3 days ago)`
+- Future intent detection — "User will implement X" + past date → "(likely already happened)"
+
+### Continuation hint
+
+When older conversation turns are dropped and observations bridge the gap, a continuation hint message is injected:
+
+- Tells the model to treat observations as its own memory
+- Instructs seamless continuation without "based on our previous conversation" phrasing
+- Only activates when the first recent message isn't from the user (indicating context trimming)
+- Injected as a separate `observational-memory-continuation` custom message
+
+### Context instructions after observations
+
+Observations are wrapped in structured XML tags with Mastra-aligned instructions:
+
+```xml
+<observations>
+Date: Feb 13, 2026 (today)
+* 🔴 (09:30) User prefers server components for data fetching
+...
+</observations>
+
+<current-task>
+Implementing search autocomplete with debouncing
+</current-task>
+
+<suggested-response>
+Show the user the SearchBar changes and ask about debounce timing
+</suggested-response>
+```
+
+Instructions tell the model to:
+- Reference specific details from observations (no generic advice)
+- Prefer most recent information when conflicts exist
+- Treat user assertions as authoritative
+- Assume planned actions are complete when their date has passed
+
+### Context injection optimization
+
+Before injection, observations are optimized to save tokens:
+- 🟡 and 🟢 emoji prefixes removed (content preserved)
+- Semantic tag brackets cleaned
+- Multiple whitespace collapsed
+
+---
+
+## Reflection status
+
+Reflection is now wired into runtime behavior:
+
+- Reflection rewrites the **same canonical memory fields** used for injection and compaction:
+  - `observations`
+  - `currentTask`
+  - `suggestedResponse`
+- Auto reflection can run after observe based on thresholds.
 - Aggressive reflection can run before compaction.
-- The reflector prompt gives explicit compression targets (20-40% moderate, 40-60% aggressive) and instructs the model to condense older items more while keeping recent details.
+- Manual reflection is available via `/om-reflect`.
 
 ---
 
@@ -65,18 +169,22 @@ flowchart TD
   C --> D[Observer model compresses transcript]
   D --> E[Merge into observations state]
   E --> F{Reflect trigger}
-  F -->|periodic threshold| F1[Observe pending segments first]
-  F -->|manual /om-reflect| F1
-  F -->|pre-compaction enabled| F1
-  F1 --> G[Reflector condenses observations]
+  F -->|periodic threshold| G[Reflector compacts observations]
+  F -->|pre-compaction enabled| G
   F -->|no trigger| H[Use current observations]
-  G -->|replaces observations| H
+  G --> H
   H --> I{memoryInjectionMode}
   I -->|all| J[Inject full observations]
   I -->|core_relevant| K[Inject core plus relevant]
-  J --> L[LLM call]
+  J --> L[Context injection]
   K --> L
-  H --> M[Compaction summary from observations]
+  L --> M[Optimize observations for tokens]
+  M --> N[Add relative time annotations]
+  N --> O{Continuation hint needed?}
+  O -->|yes| P[Inject continuation hint message]
+  O -->|no| Q[LLM call]
+  P --> Q
+  H --> R[Compaction summary from observations]
 ```
 
 ---
@@ -103,11 +211,10 @@ flowchart TD
   - Force observe without triggering compaction.
 
 - `/om-reflect`
-  - Observes any pending segments first, then reflects on all observations.
-  - Reflection output **replaces** all existing observations.
+  - Force reflection now using current observations.
 
 - `/om-reflect --aggressive`
-  - Same as above but with aggressive compression (targets 40-60% size reduction).
+  - Force more aggressive reflection compression.
 
 - `/om-observations`
   - Prints current compressed observations + task/next-step fields.
@@ -199,11 +306,9 @@ flowchart TD
   - **Use true when:** compaction boundaries should snapshot best-possible memory.
 
 - `autoObservePendingTokenThreshold`
-  - **What:** auto-triggers observation when pending segment tokens exceed this value. Set to `0` to disable.
-  - **Default:** `8000`.
-  - **Why:** prevents deadlock on large context windows where compaction never triggers because the context hook trims messages before Pi sees high usage.
-  - **Lower:** more frequent auto-observations, keeps observations fresher.
-  - **Higher:** fewer auto-observation runs, larger batches per observation.
+  - **What:** auto-observe when pending tokens exceed this threshold. Default 8000. Set 0 to disable.
+  - **Use lower when:** you want observations to stay fresh.
+  - **Use higher when:** you want fewer observer calls.
 
 #### 4) Injection strategy
 
@@ -295,7 +400,7 @@ flowchart TD
 - `PI_OM_SCOPE=thread|resource`
 - `PI_OM_SQLITE=1`
 - `PI_OM_SQLITE_PATH=/absolute/path/to/om.sqlite`
-- `PI_OM_GEMINI_MODEL=gemini-2.5-flash` (override default Gemini CLI model)
+- `PI_OM_GEMINI_MODEL=gemini-2.5-flash` (override Gemini CLI model)
 
 Notes:
 - `resource` scope auto-enables SQLite.
@@ -312,3 +417,6 @@ Notes:
 - Use `memoryInjectionMode="core_relevant"` to reduce per-call prompt cost.
 - Run `/om-observe` before manual `/compact` when you want fresh memory snapshot.
 - Use `/om-config edit` for fast tuning in Pi.
+- The priority emoji system (🔴🟡🟢) helps the observer distinguish critical user facts from routine progress.
+- Relative time annotations help the model reason about temporal context without manual date math.
+- The continuation hint ensures seamless conversation flow when older turns are dropped.

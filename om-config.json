@@ -1,5 +1,5 @@
 {
-  "recentTurnBudgetTokens": 12000,
+  "recentTurnBudgetTokens": 24000,
   "maxObservationItems": 1200,
   "maxObserverTranscriptChars": 200000,
   "maxReflectorObservationsChars": 240000,
@@ -12,5 +12,6 @@
   "enableReflection": true,
   "reflectEveryNObservations": 3,
   "reflectWhenObservationTokensOver": 3000,
-  "reflectBeforeCompaction": true
+  "reflectBeforeCompaction": true,
+  "autoObservePendingTokenThreshold": 8000
 }

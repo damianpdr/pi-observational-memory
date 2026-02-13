@@ -82,6 +82,170 @@ type ToolSummary = {
 const STATE_ENTRY_TYPE = "observational-memory-state";
 const OM_MARKER = "<pi-observational-memory>";
 const OM_CONTEXT_CUSTOM_TYPE = "observational-memory-context";
+const OM_CONTINUATION_CUSTOM_TYPE = "observational-memory-continuation";
+
+// ════════════════════════════════════════════════════════════════════════════
+// Mastra-aligned constants: Context injection
+// ════════════════════════════════════════════════════════════════════════════
+
+const OBSERVATION_CONTINUATION_HINT = `This message is not from the user, the conversation history grew too long and wouldn't fit in context! Thankfully the entire conversation is stored in your memory observations. Please continue from where the observations left off. Do not refer to your "memory observations" directly, the user doesn't know about them, they are your memories! Just respond naturally as if you're remembering the conversation (you are!). Do not say "Hi there!" or "based on our previous conversation" as if the conversation is just starting, this is not a new conversation. This is an ongoing conversation, keep continuity by responding based on your memory. For example do not say "I understand. I've reviewed my memory observations", or "I remember [...]". Answer naturally following the suggestion from your memory. Note that your memory may contain a suggested first response, which you should follow.
+
+IMPORTANT: this system reminder is NOT from the user. The system placed it here as part of your memory system. This message is part of you remembering your conversation with the user.
+
+NOTE: Any messages following this system reminder are newer than your memories.`;
+
+const OBSERVATION_CONTEXT_PROMPT = `The following observations block contains your memory of past conversations in this coding session.`;
+
+const OBSERVATION_CONTEXT_INSTRUCTIONS = `IMPORTANT: When responding, reference specific details from these observations. Do not give generic advice - personalize your response based on what you know about the user's project, decisions, and progress. If the user asks about prior work, connect it to specific observations above.
+
+KNOWLEDGE UPDATES: When asked about current state (e.g., "where did we leave off?", "what's the current status?"), always prefer the MOST RECENT information. Observations include dates - if you see conflicting information, the newer observation supersedes the older one. Look for phrases like "will start", "is switching", "changed to", "moved to" as indicators that previous information has been updated.
+
+PLANNED ACTIONS: If the user or agent stated they planned to do something (e.g., "will implement...", "next step is...") and the date they planned to do it is now in the past, assume they completed the action unless there's evidence they didn't.`;
+
+// ════════════════════════════════════════════════════════════════════════════
+// Mastra-aligned constants: Observer extraction instructions
+// ════════════════════════════════════════════════════════════════════════════
+
+const OBSERVER_EXTRACTION_INSTRUCTIONS = `CRITICAL: DISTINGUISH USER ASSERTIONS FROM QUESTIONS/REQUESTS
+
+When the user TELLS you something, mark it as an assertion:
+- "I prefer tabs over spaces" → 🔴 (14:30) User stated prefers tabs over spaces
+- "We use PostgreSQL" → 🔴 (14:31) User stated project uses PostgreSQL
+- "The API endpoint changed to /v2" → 🔴 (14:32) User stated API endpoint changed to /v2
+
+When the user ASKS or REQUESTS something, mark it as a question/request:
+- "Can you refactor this function?" → 🟡 (15:00) User asked to refactor function
+- "What's causing this error?" → 🟡 (15:01) User asked about error cause
+
+Distinguish between QUESTIONS and STATEMENTS OF INTENT:
+- "Can you fix..." → Question (extract as "User asked...")
+- "I'm going to refactor the auth module" → Statement of intent (extract as "User stated they will refactor auth module")
+
+STATE CHANGES AND UPDATES:
+When information changes, frame it as a state change that supersedes previous information:
+- "I switched from REST to GraphQL" → "User switched from REST to GraphQL (no longer using REST)"
+- "We moved the config to .env" → "User moved config to .env (replacing previous config location)"
+
+USER ASSERTIONS ARE AUTHORITATIVE. The user is the source of truth about their own project.
+
+TEMPORAL ANCHORING:
+Each observation has TWO potential timestamps:
+
+1. BEGINNING: The time the statement was made (from the message timestamp) - ALWAYS include this
+2. END: The time being REFERENCED, if different - ONLY when there's a relative time reference
+
+FORMAT:
+- With time reference: (TIME) [observation]. (meaning/estimated DATE)
+- Without time reference: (TIME) [observation].
+
+GOOD: (09:15) User's deployment failed last Tuesday. (meaning Feb 10, 2026)
+GOOD: (09:15) User prefers TypeScript strict mode.
+BAD: (09:15) User prefers TypeScript strict mode. (meaning Feb 13, 2026 - today)
+
+IMPORTANT: If an observation contains MULTIPLE events, split them into SEPARATE observation lines, each with its own date.
+
+PRESERVE UNUSUAL PHRASING:
+When the user uses unexpected or non-standard terminology, quote their exact words.
+
+BAD: User wants to improve performance.
+GOOD: User stated they want to fix the "janky scroll" (their term for scroll performance issues).
+
+PRESERVING TECHNICAL DETAILS:
+
+1. FILE PATHS AND CODE REFERENCES:
+   Always preserve exact file paths, function names, line numbers, error messages.
+   BAD: Agent fixed a bug in the auth code.
+   GOOD: Agent fixed null check bug in src/lib/auth.ts:45 (missing guard on session.user).
+
+2. TOOL CALL SEQUENCES:
+   Group related tool calls with indentation:
+   * 🟡 (14:33) Agent debugging auth issue
+     * -> ran git status, found 3 modified files
+     * -> viewed src/lib/auth.ts:45-60, found missing null check
+     * -> applied fix, tests now pass
+
+3. COMMANDS AND OUTPUTS:
+   Preserve exact commands, error messages, and key outputs.
+   BAD: Agent ran some commands to fix the build.
+   GOOD: Agent ran \`npm run build\`, got TS2345 error in SearchBar.tsx, fixed by adding type assertion.
+
+4. ARCHITECTURE DECISIONS:
+   Capture the decision AND the reasoning.
+   BAD: Team decided on the new approach.
+   GOOD: User chose server components over client components for SearchResults (reason: reduces bundle size, data fetching at server).
+
+CONVERSATION CONTEXT:
+- What the user is working on or asking about
+- Previous topics and their outcomes
+- Specific requirements or constraints mentioned
+- Answers to user questions with enough context to reproduce the answer
+- Agent explanations, especially complex ones - observe fine details so agent doesn't forget
+- Relevant code snippets and their locations
+- User preferences (coding style, tools, frameworks)
+- Any specifically formatted text that would need to be reproduced later (preserve verbatim)
+- When who/what/where/when is mentioned, note all dimensions
+
+ACTIONABLE INSIGHTS:
+- What worked well and what failed
+- What needs follow-up or clarification
+- User's stated goals or next steps`;
+
+const OBSERVER_OUTPUT_FORMAT = `Use priority levels:
+- 🔴 High: explicit user facts, preferences, goals achieved, critical decisions, blockers
+- 🟡 Medium: project details, tool results, file changes, implementation progress
+- 🟢 Low: minor details, uncertain observations, exploratory notes
+
+Group related observations (like tool sequences) by indenting:
+* 🟡 (14:33) Agent debugging auth issue
+  * -> ran git status, found 3 modified files
+  * -> viewed src/lib/auth.ts:45-60, found missing null check
+  * -> applied fix, tests now pass
+
+Group observations by date, then list each with 24-hour time.
+
+<observations>
+Date: Feb 12, 2026
+* 🔴 (14:30) User stated project uses Next.js 15 with App Router
+* 🟡 (14:31) Working on search autocomplete feature
+* 🟡 (14:45) Agent implemented fuzzy matching in src/utils/searchUtils.ts
+  * -> added Levenshtein distance calculation
+  * -> integrated with existing SearchBar component
+* 🔴 (15:00) User prefers server components for data fetching
+* 🟢 (15:10) May need to add debouncing to search input
+
+Date: Feb 13, 2026
+* 🟡 (09:15) Continued search feature - added result highlighting
+* 🔴 (09:30) User found bug: search fails on special characters
+* 🟡 (09:45) Agent fixed by escaping regex in searchUtils.ts:23
+</observations>
+
+<current-task>
+State the current task(s) explicitly. Can be single or multiple:
+- Primary: What the agent is currently working on
+- Secondary: Other pending tasks (mark as "waiting for user" if appropriate)
+
+If the agent started doing something without user approval, note that it's off-task.
+</current-task>
+
+<suggested-response>
+Hint for the agent's immediate next message. Examples:
+- "The search fix is ready. Show the user the changes in searchUtils.ts..."
+- "The assistant should wait for the user to respond before continuing."
+- Call the view tool on src/components/SearchBar.tsx to continue debugging.
+</suggested-response>`;
+
+const OBSERVER_GUIDELINES = `- Be specific enough for the assistant to act on
+- Good: "User prefers short, direct answers without lengthy explanations"
+- Bad: "User stated a preference" (too vague)
+- Add 1 to 5 observations per exchange
+- Use terse language to save tokens. Sentences should be dense without unnecessary words.
+- Do not add repetitive observations that have already been observed.
+- If the agent calls tools, observe what was called, why, and what was learned.
+- When observing files with line numbers, include the line number if useful.
+- If the agent provides a detailed response, observe the contents so it could be repeated.
+- Make sure you start each observation with a priority emoji (🔴, 🟡, 🟢)
+- Observe WHAT the agent did and WHAT it means, not HOW well it did it.
+- If the user provides detailed messages or code snippets, observe all important details.`;
 
 type OmMemoryInjectionMode = "all" | "core_relevant";
 
@@ -297,6 +461,164 @@ function trimPreview(text: string, maxChars = 320): string {
 	return `${normalized.slice(0, maxChars)}…`;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Mastra-aligned: Relative time annotations for observations
+// ════════════════════════════════════════════════════════════════════════════
+
+function formatRelativeTime(date: Date, currentDate: Date): string {
+	const diffMs = currentDate.getTime() - date.getTime();
+	const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+	if (diffDays < 0) {
+		const futureDays = Math.abs(diffDays);
+		if (futureDays === 0) return "today";
+		if (futureDays === 1) return "tomorrow";
+		if (futureDays < 7) return `in ${futureDays} days`;
+		if (futureDays < 14) return "in 1 week";
+		if (futureDays < 30) return `in ${Math.floor(futureDays / 7)} weeks`;
+		return `in ${Math.floor(futureDays / 30)} month${Math.floor(futureDays / 30) > 1 ? "s" : ""}`;
+	}
+	if (diffDays === 0) return "today";
+	if (diffDays === 1) return "yesterday";
+	if (diffDays < 7) return `${diffDays} days ago`;
+	if (diffDays < 14) return "1 week ago";
+	if (diffDays < 30) return `${Math.floor(diffDays / 7)} weeks ago`;
+	if (diffDays < 60) return "1 month ago";
+	if (diffDays < 365) return `${Math.floor(diffDays / 30)} months ago`;
+	return `${Math.floor(diffDays / 365)} year${Math.floor(diffDays / 365) > 1 ? "s" : ""} ago`;
+}
+
+function formatGapBetweenDates(prevDate: Date, currDate: Date): string | null {
+	const diffMs = currDate.getTime() - prevDate.getTime();
+	const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+	if (diffDays <= 1) return null;
+	if (diffDays < 7) return `[${diffDays} days later]`;
+	if (diffDays < 14) return "[1 week later]";
+	if (diffDays < 30) return `[${Math.floor(diffDays / 7)} weeks later]`;
+	if (diffDays < 60) return "[1 month later]";
+	return `[${Math.floor(diffDays / 30)} months later]`;
+}
+
+function parseDateFromContent(dateContent: string): Date | null {
+	// "May 30, 2023"
+	const simpleDateMatch = dateContent.match(/([A-Z][a-z]+)\s+(\d{1,2}),?\s+(\d{4})/);
+	if (simpleDateMatch) {
+		const parsed = new Date(`${simpleDateMatch[1]} ${simpleDateMatch[2]}, ${simpleDateMatch[3]}`);
+		if (!isNaN(parsed.getTime())) return parsed;
+	}
+	// "May 27-28, 2023" - use first date
+	const rangeMatch = dateContent.match(/([A-Z][a-z]+)\s+(\d{1,2})-\d{1,2},?\s+(\d{4})/);
+	if (rangeMatch) {
+		const parsed = new Date(`${rangeMatch[1]} ${rangeMatch[2]}, ${rangeMatch[3]}`);
+		if (!isNaN(parsed.getTime())) return parsed;
+	}
+	// "late/early/mid Month Year"
+	const vagueMatch = dateContent.match(/(late|early|mid)[- ]?(?:to[- ]?(?:late|early|mid)[- ]?)?([A-Z][a-z]+)\s+(\d{4})/i);
+	if (vagueMatch) {
+		const modifier = vagueMatch[1]!.toLowerCase();
+		let day = 15;
+		if (modifier === "early") day = 7;
+		if (modifier === "late") day = 23;
+		const parsed = new Date(`${vagueMatch[2]} ${day}, ${vagueMatch[3]}`);
+		if (!isNaN(parsed.getTime())) return parsed;
+	}
+	return null;
+}
+
+function isFutureIntentObservation(line: string): boolean {
+	const futureIntentPatterns = [
+		/\bwill\s+(?:be\s+)?(?:\w+ing|\w+)\b/i,
+		/\bplans?\s+to\b/i,
+		/\bplanning\s+to\b/i,
+		/\bgoing\s+to\b/i,
+		/\bintends?\s+to\b/i,
+		/\bwants?\s+to\b/i,
+		/\bneeds?\s+to\b/i,
+		/\babout\s+to\b/i,
+	];
+	return futureIntentPatterns.some((pattern) => pattern.test(line));
+}
+
+function expandInlineEstimatedDates(observations: string, currentDate: Date): string {
+	const inlineDateRegex = /\((estimated|meaning)\s+([^)]+\d{4})\)/gi;
+
+	return observations.replace(inlineDateRegex, (match, prefix: string, dateContent: string) => {
+		const targetDate = parseDateFromContent(dateContent);
+		if (!targetDate) return match;
+
+		const relative = formatRelativeTime(targetDate, currentDate);
+		const matchIndex = observations.indexOf(match);
+		const lineStart = observations.lastIndexOf("\n", matchIndex) + 1;
+		const lineBeforeDate = observations.substring(lineStart, matchIndex);
+
+		const isPastDate = targetDate < currentDate;
+		const isFuture = isFutureIntentObservation(lineBeforeDate);
+
+		if (isPastDate && isFuture) {
+			return `(${prefix} ${dateContent} - ${relative}, likely already happened)`;
+		}
+		return `(${prefix} ${dateContent} - ${relative})`;
+	});
+}
+
+function addRelativeTimeToObservations(observations: string, currentDate: Date): string {
+	const withInlineDates = expandInlineEstimatedDates(observations, currentDate);
+
+	const dateHeaderRegex = /^(Date:\s*)([A-Z][a-z]+ \d{1,2}, \d{4})$/gm;
+
+	// Collect all dates for gap markers
+	const dates: { index: number; date: Date; match: string; prefix: string; dateStr: string }[] = [];
+	let regexMatch: RegExpExecArray | null;
+
+	while ((regexMatch = dateHeaderRegex.exec(withInlineDates)) !== null) {
+		const parsed = new Date(regexMatch[2]!);
+		if (!isNaN(parsed.getTime())) {
+			dates.push({
+				index: regexMatch.index,
+				date: parsed,
+				match: regexMatch[0],
+				prefix: regexMatch[1]!,
+				dateStr: regexMatch[2]!,
+			});
+		}
+	}
+
+	if (dates.length === 0) return withInlineDates;
+
+	// Replace from end to preserve indices
+	let result = withInlineDates;
+	for (let i = dates.length - 1; i >= 0; i--) {
+		const d = dates[i]!;
+		const relative = formatRelativeTime(d.date, currentDate);
+		let replacement = `${d.prefix}${d.dateStr} (${relative})`;
+
+		if (i > 0) {
+			const gap = formatGapBetweenDates(dates[i - 1]!.date, d.date);
+			if (gap) {
+				replacement = `\n${gap}\n${replacement}`;
+			}
+		}
+
+		result = result.slice(0, d.index) + replacement + result.slice(d.index + d.match.length);
+	}
+
+	return result;
+}
+
+function optimizeObservationsForContext(observations: string): string {
+	let optimized = observations;
+	// Remove 🟡 and 🟢 emojis (keep 🔴 for critical items) to save tokens
+	optimized = optimized.replace(/🟡\s*/g, "");
+	optimized = optimized.replace(/🟢\s*/g, "");
+	// Remove semantic tags like [label, label] but keep collapsed markers
+	optimized = optimized.replace(/\[(?![\d\s]*items collapsed)[^\]]+\]/g, "");
+	// Clean up multiple spaces / newlines
+	optimized = optimized.replace(/  +/g, " ");
+	optimized = optimized.replace(/\n{3,}/g, "\n\n");
+	return optimized.trim();
+}
+
 function roughTextTokenizer(text: string, modelHint?: string): number {
 	if (!text) return 0;
 	const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) ?? [];
@@ -368,30 +690,38 @@ function buildTranscriptFromSegments(segments: PendingSegment[]): string {
 }
 
 function formatObservationalMemoryMessage(state: OmState): string {
-	const blocks: string[] = [
-		OM_MARKER,
-		"Memory sync payload. Treat this as authoritative compressed memory from prior turns.",
-		"If the live chat history conflicts with this payload, prioritize this payload.",
-		"",
-	];
+	const currentDate = new Date();
+	let optimized = optimizeObservationsForContext(state.observations.trim());
+	if (optimized) {
+		optimized = addRelativeTimeToObservations(optimized, currentDate);
+	}
 
-	if (state.observations.trim()) {
-		blocks.push("## Observations");
-		blocks.push(state.observations.trim());
+	const blocks: string[] = [OM_MARKER, ""];
+
+	if (optimized) {
+		blocks.push(OBSERVATION_CONTEXT_PROMPT);
+		blocks.push("");
+		blocks.push("<observations>");
+		blocks.push(optimized);
+		blocks.push("</observations>");
+		blocks.push("");
+		blocks.push(OBSERVATION_CONTEXT_INSTRUCTIONS);
 		blocks.push("");
 	}
+
 	if (state.currentTask?.trim()) {
-		blocks.push("## Current task");
+		blocks.push("<current-task>");
 		blocks.push(state.currentTask.trim());
+		blocks.push("</current-task>");
 		blocks.push("");
 	}
 	if (state.suggestedResponse?.trim()) {
-		blocks.push("## Suggested next step");
+		blocks.push("<suggested-response>");
 		blocks.push(state.suggestedResponse.trim());
+		blocks.push("</suggested-response>");
 		blocks.push("");
 	}
 
-	blocks.push("Always use this memory when answering what happened previously in this session.");
 	return blocks.join("\n");
 }
 
@@ -473,34 +803,44 @@ function buildCoreAndRelevantObservations(state: OmState, recentMessages: any[])
 }
 
 function formatCoreRelevantMemoryMessage(state: OmState, recentMessages: any[]): string {
+	const currentDate = new Date();
 	const parts = buildCoreAndRelevantObservations(state, recentMessages);
-	const blocks: string[] = [
-		OM_MARKER,
-		"Memory sync payload (core + relevant retrieval).",
-		"If the live chat history conflicts with this payload, prioritize this payload.",
-		"",
-	];
+
+	const blocks: string[] = [OM_MARKER, ""];
+	blocks.push(OBSERVATION_CONTEXT_PROMPT);
+	blocks.push("");
 
 	if (parts.core.length) {
+		let coreText = optimizeObservationsForContext(parts.core.join("\n"));
+		coreText = addRelativeTimeToObservations(coreText, currentDate);
+		blocks.push("<observations>");
 		blocks.push("## Core memory");
-		blocks.push(parts.core.join("\n"));
-		blocks.push("");
-	}
+		blocks.push(coreText);
 
-	if (parts.relevant.length) {
-		blocks.push("## Relevant observations for current turn");
-		blocks.push(parts.relevant.join("\n"));
+		if (parts.relevant.length) {
+			let relevantText = optimizeObservationsForContext(parts.relevant.join("\n"));
+			relevantText = addRelativeTimeToObservations(relevantText, currentDate);
+			blocks.push("");
+			blocks.push("## Relevant observations for current turn");
+			blocks.push(relevantText);
+		}
+
+		blocks.push("</observations>");
+		blocks.push("");
+		blocks.push(OBSERVATION_CONTEXT_INSTRUCTIONS);
 		blocks.push("");
 	}
 
 	if (state.currentTask?.trim()) {
-		blocks.push("## Current task");
+		blocks.push("<current-task>");
 		blocks.push(state.currentTask.trim());
+		blocks.push("</current-task>");
 		blocks.push("");
 	}
 	if (state.suggestedResponse?.trim()) {
-		blocks.push("## Suggested next step");
+		blocks.push("<suggested-response>");
 		blocks.push(state.suggestedResponse.trim());
+		blocks.push("</suggested-response>");
 		blocks.push("");
 	}
 
@@ -567,27 +907,51 @@ function buildObserverPrompt(existingObservations: string, newTranscript: string
 		? newTranscript.slice(0, omConfig.maxObserverTranscriptChars) + "\n\n[...truncated...]"
 		: newTranscript;
 
-	return `You are an Observer agent for long coding sessions.
+	let prompt = `You are the memory consciousness of an AI coding assistant. Your observations will be the ONLY information the assistant has about past interactions in this coding session.
 
-Compress the transcript into durable, high-signal observations.
+Extract observations that will help the assistant remember:
 
-Rules:
-- Keep key decisions, constraints, file changes, errors, and outcomes.
-- Keep exact technical anchors (paths, APIs, commands, identifiers, line refs if present).
-- Deduplicate against previous observations.
-- Keep concise and dense.
-- If work is ongoing, set <current-task>.
-- If there is an obvious next agent reply, set <suggested-response>.
+${OBSERVER_EXTRACTION_INSTRUCTIONS}
 
-Output strictly as:
-<observations>...</observations>
-<current-task>...</current-task>
-<suggested-response>...</suggested-response>
+=== OUTPUT FORMAT ===
 
-${existingObservations.trim() ? `Existing observations:\n${existingObservations}` : "No previous observations."}
+Your output MUST use XML tags to structure the response. This allows the system to properly parse and manage memory over time.
 
-Transcript to observe:
-${truncatedTranscript}`;
+${OBSERVER_OUTPUT_FORMAT}
+
+=== GUIDELINES ===
+
+${OBSERVER_GUIDELINES}
+
+Remember: These observations are the assistant's ONLY memory. Make them count.
+
+User messages are extremely important. If the user asks a question or gives a new task, make it clear in <current-task> that this is the priority. If the assistant needs to respond to the user, indicate in <suggested-response> that it should pause for user reply before continuing other tasks.
+
+`;
+
+	if (existingObservations.trim()) {
+		prompt += `## Previous Observations
+
+${existingObservations}
+
+---
+
+Do not repeat these existing observations. Your new observations will be appended to the existing observations.
+
+`;
+	}
+
+	prompt += `## New Message History to Observe
+
+${truncatedTranscript}
+
+---
+
+## Your Task
+
+Extract new observations from the message history above. Do not repeat observations that are already in the previous observations. Add your new observations in the format specified in your instructions.`;
+
+	return prompt;
 }
 
 function buildReflectorPrompt(observations: string, aggressive = false): string {
@@ -1130,6 +1494,7 @@ export default function (pi: ExtensionAPI) {
 		const nonSystemMessages = event.messages.filter((m: any) => m?.role !== "system");
 		const cleanedNonSystemMessages = nonSystemMessages.filter((m: any) => {
 			if (m?.role === "custom" && m?.customType === OM_CONTEXT_CUSTOM_TYPE) return false;
+			if (m?.role === "custom" && m?.customType === OM_CONTINUATION_CUSTOM_TYPE) return false;
 			if (m?.role === "system" && typeof m?.content === "string" && m.content.includes(OM_MARKER)) return false;
 			return true;
 		});
@@ -1146,13 +1511,34 @@ export default function (pi: ExtensionAPI) {
 			timestamp: Date.now(),
 		};
 
-		const finalMessages = state.observations.trim()
-			? [...systemMessages, omContextMessage, ...recentMessages]
-			: [...systemMessages, ...recentMessages];
-		const totalTokens = finalMessages.reduce(
-			(sum, m: any) => sum + roughTextTokenizer(typeof m.content === "string" ? m.content : JSON.stringify(m.content)),
-			0,
-		);
+		// Continuation hint: injected after observations + before recent messages
+		// Helps the model seamlessly continue from compressed memory when older turns are dropped
+		const omContinuationMessage: any = {
+			role: "custom",
+			customType: OM_CONTINUATION_CUSTOM_TYPE,
+			content: OBSERVATION_CONTINUATION_HINT,
+			display: false,
+			timestamp: Date.now(),
+		};
+
+		const hasObservations = !!state.observations.trim();
+
+		// Determine if we need the continuation hint:
+		// Only inject when observations exist and recent messages don't start with a user message
+		// (meaning older context was trimmed, so the model needs help bridging the gap)
+		const needsContinuationHint = hasObservations && recentMessages.length > 0
+			&& recentMessages[0]?.role !== "user";
+
+		let finalMessages: any[];
+		if (hasObservations) {
+			if (needsContinuationHint) {
+				finalMessages = [...systemMessages, omContextMessage, omContinuationMessage, ...recentMessages];
+			} else {
+				finalMessages = [...systemMessages, omContextMessage, ...recentMessages];
+			}
+		} else {
+			finalMessages = [...systemMessages, ...recentMessages];
+		}
 
 		return { messages: finalMessages };
 	});
