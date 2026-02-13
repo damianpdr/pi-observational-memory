@@ -992,10 +992,40 @@ ${aggressive
 - Target 20-40% size reduction from input
 - Your detail level should be ~8/10`}
 
-Output strictly as:
-<observations>...</observations>
-<current-task>...</current-task>
-<suggested-response>...</suggested-response>
+=== OUTPUT FORMAT (MUST FOLLOW) ===
+
+The observer creates observations using this format. Your reflection MUST use the same format so the memory system stays consistent.
+
+Use priority levels on every observation line:
+- 🔴 High: explicit user facts, preferences, goals achieved, critical decisions, blockers
+- 🟡 Medium: project details, tool results, file changes, implementation progress
+- 🟢 Low: minor details, uncertain observations, exploratory notes
+
+Group observations by date, then list each with 24-hour time:
+
+<observations>
+Date: Feb 12, 2026
+* 🔴 (14:30) User stated project uses Next.js 15 with App Router
+* 🟡 (14:45) Agent implemented fuzzy matching in src/utils/searchUtils.ts
+  * -> added Levenshtein distance calculation
+  * -> integrated with existing SearchBar component
+* 🔴 (15:00) User prefers server components for data fetching
+
+Date: Feb 13, 2026
+* 🟡 (09:15) Continued search feature - added result highlighting
+</observations>
+
+<current-task>
+What the agent is currently working on. If off-task, note it.
+</current-task>
+
+<suggested-response>
+Hint for the agent's immediate next message.
+</suggested-response>
+
+IMPORTANT: If the input observations are NOT in this format (e.g. plain bullets, markdown headers), you MUST convert them to this format during reflection. Assign priority emojis based on content importance. Use the earliest reasonable timestamp for each item. Group by date.
+
+---
 
 Observations to reflect on:
 ${truncatedObs}`;

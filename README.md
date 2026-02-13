@@ -158,6 +158,15 @@ Reflection is now wired into runtime behavior:
 - Aggressive reflection can run before compaction.
 - Manual reflection is available via `/om-reflect`.
 
+### Observer instruction echo (format-aware reflector)
+
+The reflector prompt includes the full observer output format spec (priority emojis, date grouping, 24h timestamps). This ensures:
+
+- Reflections maintain the same structured format as observations
+- Old-format observations (plain markdown bullets) are **converted** to the new format during reflection
+- Priority emojis are assigned based on content importance during conversion
+- Date grouping is applied even if input observations lack dates
+
 ---
 
 ## High-level flow (graph)
