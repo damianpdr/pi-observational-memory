@@ -20,26 +20,6 @@ type PendingSegment = {
 	createdAt: string;
 	text: string;
 	tokens: number;
-	buffered: boolean;
-};
-
-type BufferedObservationChunk = {
-	id: string;
-	createdAt: string;
-	segmentIds: string[];
-	sourceTokens: number;
-	observations: string;
-	observationTokens: number;
-	currentTask?: string;
-	suggestedResponse?: string;
-};
-
-type BufferedReflection = {
-	createdAt: string;
-	observations: string;
-	tokens: number;
-	currentTask?: string;
-	suggestedResponse?: string;
 };
 
 type OmState = {
@@ -56,9 +36,6 @@ type OmState = {
 	reflections: ReflectionSnapshot[];
 	pendingSegments: PendingSegment[];
 	pendingTokens: number;
-	pendingChunks: number;
-	bufferedChunks: BufferedObservationChunk[];
-	bufferedReflection?: BufferedReflection;
 	isBufferingObservation: boolean;
 	isBufferingReflection: boolean;
 };
@@ -67,16 +44,6 @@ type OmSections = {
 	observations: string;
 	currentTask?: string;
 	suggestedResponse?: string;
-};
-
-type ToolSummary = {
-	name: string;
-	isError: boolean;
-	exitCode?: number;
-	paths: string[];
-	inputSummary?: string;
-	outputSummary?: string;
-	tokens: number;
 };
 
 const STATE_ENTRY_TYPE = "observational-memory-state";
@@ -298,8 +265,12 @@ const STOPWORDS = new Set([
 	"user", "assistant", "agent", "tool", "task",
 ]);
 
-const PROJECT_OM_CONFIG_PATH = join(process.cwd(), ".pi", "extensions", "observational-memory", "om-config.json");
+const OM_CONFIG_RELATIVE_PATH = join(".pi", "extensions", "observational-memory", "om-config.json");
 const GLOBAL_OM_CONFIG_PATH = join(homedir(), ".pi", "agent", "extensions", "observational-memory", "om-config.json");
+
+function projectOmConfigPathFor(cwd: string): string {
+	return join(cwd, OM_CONFIG_RELATIVE_PATH);
+}
 
 function coerceNumber(value: unknown, fallback: number, min = 1): number {
 	if (!Number.isFinite(value)) return fallback;
@@ -346,8 +317,9 @@ function normalizeOmConfig(raw: any): OmConfig {
 	};
 }
 
-function loadOmConfig(): { config: OmConfig; path?: string } {
-	const candidates = [PROJECT_OM_CONFIG_PATH, GLOBAL_OM_CONFIG_PATH];
+function loadOmConfig(cwd: string): { config: OmConfig; path?: string } {
+	const projectPath = projectOmConfigPathFor(cwd);
+	const candidates = [projectPath, GLOBAL_OM_CONFIG_PATH];
 	for (const path of candidates) {
 		if (!existsSync(path)) continue;
 		try {
@@ -360,10 +332,12 @@ function loadOmConfig(): { config: OmConfig; path?: string } {
 	return { config: { ...DEFAULT_OM_CONFIG } };
 }
 
-function saveProjectOmConfig(config: OmConfig): void {
-	const dir = dirname(PROJECT_OM_CONFIG_PATH);
+function saveProjectOmConfig(cwd: string, config: OmConfig): string {
+	const projectPath = projectOmConfigPathFor(cwd);
+	const dir = dirname(projectPath);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(PROJECT_OM_CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+	writeFileSync(projectPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+	return projectPath;
 }
 
 class OmSqliteStore {
@@ -437,8 +411,6 @@ function createInitialState(scope: StorageScope = STORAGE_SCOPE): OmState {
 		reflections: [],
 		pendingSegments: [],
 		pendingTokens: 0,
-		pendingChunks: 0,
-		bufferedChunks: [],
 		isBufferingObservation: false,
 		isBufferingReflection: false,
 	};
@@ -446,13 +418,6 @@ function createInitialState(scope: StorageScope = STORAGE_SCOPE): OmState {
 
 function randomId(prefix: string): string {
 	return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function truncateMiddle(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	const head = Math.floor(maxChars * 0.65);
-	const tail = Math.floor(maxChars * 0.25);
-	return `${text.slice(0, head)}\n...[truncated ${text.length - head - tail} chars]...\n${text.slice(-tail)}`;
 }
 
 function trimPreview(text: string, maxChars = 320): string {
@@ -682,7 +647,6 @@ function mergeObservationItems(existingText: string, incomingText: string): stri
 
 function recomputePendingCounters(state: OmState): void {
 	state.pendingTokens = state.pendingSegments.reduce((sum, s) => sum + s.tokens, 0);
-	state.pendingChunks = state.pendingSegments.length;
 }
 
 function buildTranscriptFromSegments(segments: PendingSegment[]): string {
@@ -1054,6 +1018,30 @@ async function resolveCompressionModel(ctx: ExtensionContext): Promise<{ model: 
 	return undefined;
 }
 
+function extractCompletionText(response: any): string {
+	const choices = response?.choices;
+	if (Array.isArray(choices) && choices.length > 0) {
+		const message = choices[0]?.message;
+		if (typeof message?.content === "string") {
+			return message.content.trim();
+		}
+	}
+
+	if (Array.isArray(response?.content)) {
+		return response.content
+			.filter((c: any) => c?.type === "text")
+			.map((c: any) => c.text)
+			.join("\n")
+			.trim();
+	}
+
+	if (typeof response?.content === "string") {
+		return response.content.trim();
+	}
+
+	return "";
+}
+
 let geminiCliChecked: boolean | undefined;
 async function isGeminiCliAvailable(): Promise<boolean> {
 	if (geminiCliChecked !== undefined) return geminiCliChecked;
@@ -1108,19 +1096,28 @@ async function callGeminiCli(prompt: string, signal?: AbortSignal): Promise<stri
 	});
 }
 
+function resolveScopeKey(ctx: ExtensionContext): string {
+	if (STORAGE_SCOPE === "resource") {
+		return `resource:${ctx.cwd}`;
+	}
+	const sessionFile = ctx.sessionManager.getSessionFile();
+	if (sessionFile) return `thread:${sessionFile}`;
+	const sessionId = ctx.sessionManager.getSessionId();
+	if (sessionId) return `thread:${sessionId}`;
+	return `thread:${ctx.cwd}`;
+}
+
 export default function (pi: ExtensionAPI) {
 	const sqlite = new OmSqliteStore(SQLITE_ENABLED, SQLITE_PATH);
 
 	let state: OmState = createInitialState(STORAGE_SCOPE);
 	let warnedMissingModel = false;
 	let activeScopeKey = "";
-	let epoch = 0;
-	let lastObserverParseFailurePreview: string | undefined;
 	let forceCompactionFromObserve = false;
 	let activeConfigPath: string | undefined;
 
 	const reloadOmConfig = (ctx: ExtensionContext, notify = false) => {
-		const loaded = loadOmConfig();
+		const loaded = loadOmConfig(ctx.cwd);
 		omConfig = loaded.config;
 		activeConfigPath = loaded.path;
 		if (notify) {
@@ -1162,10 +1159,19 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("observational-memory", parts.join(" | "));
 	};
 
+	const pushPendingSegment = (segment: Omit<PendingSegment, "id" | "createdAt"> & Partial<Pick<PendingSegment, "id" | "createdAt">>) => {
+		state.pendingSegments.push({
+			id: segment.id || randomId("seg"),
+			createdAt: segment.createdAt || new Date().toISOString(),
+			text: segment.text,
+			tokens: Math.max(1, segment.tokens),
+		});
+		recomputePendingCounters(state);
+	};
+
 	const loadState = (ctx: ExtensionContext) => {
-		epoch += 1;
 		reloadOmConfig(ctx);
-		activeScopeKey = `thread:${ctx.cwd}`;
+		activeScopeKey = resolveScopeKey(ctx);
 
 		let loaded: OmState | undefined;
 		if (sqlite.enabled) {
@@ -1222,27 +1228,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					{ apiKey: resolved.apiKey, maxTokens: 8192, signal },
 				);
-
-				// Extract text from API response
-				const choices = (response as any)?.choices;
-				if (Array.isArray(choices) && choices.length > 0) {
-					const message = choices[0]?.message;
-					if (message?.content) {
-						text = typeof message.content === "string" ? message.content.trim() : "";
-					}
-				}
-				
-				if (!text && Array.isArray(response?.content)) {
-					text = response.content
-						.filter((c: any) => c?.type === "text")
-						.map((c: any) => c.text)
-						.join("\n")
-						.trim();
-				}
-				
-				if (!text && typeof response?.content === "string") {
-					text = response.content.trim();
-				}
+				text = extractCompletionText(response);
 			} else if (!usedGeminiCli) {
 				if (!warnedMissingModel) {
 					warnedMissingModel = true;
@@ -1254,12 +1240,7 @@ export default function (pi: ExtensionAPI) {
 		warnedMissingModel = false;
 
 		const parsed = parseOmSections(text);
-		if (!parsed.observations.trim()) {
-			lastObserverParseFailurePreview = trimPreview(text || "(empty)", 320);
-			return undefined;
-		}
-
-		lastObserverParseFailurePreview = undefined;
+		if (!parsed.observations.trim()) return undefined;
 		const outTokens = roughTextTokenizer(parsed.observations);
 		state.lastCompressionRatio = Number((inputTokens / Math.max(1, outTokens)).toFixed(2));
 		state.lastObservedAt = new Date().toISOString();
@@ -1302,26 +1283,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					{ apiKey: resolved.apiKey, maxTokens: 8192, signal },
 				);
-
-				const choices = (response as any)?.choices;
-				if (Array.isArray(choices) && choices.length > 0) {
-					const message = choices[0]?.message;
-					if (message?.content) {
-						text = typeof message.content === "string" ? message.content.trim() : "";
-					}
-				}
-
-				if (!text && Array.isArray(response?.content)) {
-					text = response.content
-						.filter((c: any) => c?.type === "text")
-						.map((c: any) => c.text)
-						.join("\n")
-						.trim();
-				}
-
-				if (!text && typeof response?.content === "string") {
-					text = response.content.trim();
-				}
+				text = extractCompletionText(response);
 			}
 		}
 
@@ -1401,30 +1363,38 @@ export default function (pi: ExtensionAPI) {
 
 	const observeNow = async (
 		ctx: ExtensionContext,
-		opts: { triggerAutoReflect?: boolean } = {},
+		opts: { triggerAutoReflect?: boolean; signal?: AbortSignal } = {},
 	): Promise<boolean> => {
 		if (!state.pendingSegments.length) return false;
-		const transcript = buildTranscriptFromSegments(state.pendingSegments);
-		const tokens = state.pendingTokens;
-		const parsed = await runObserverCall(ctx, transcript, tokens);
-		if (!parsed) return false;
+		if (state.isBufferingObservation) return false;
 
-		state.observations = mergeObservationItems(state.observations, parsed.observations);
-		state.observationTokens = roughTextTokenizer(state.observations);
-		if (parsed.currentTask) state.currentTask = parsed.currentTask;
-		if (parsed.suggestedResponse) state.suggestedResponse = parsed.suggestedResponse;
-		state.observationRuns += 1;
+		state.isBufferingObservation = true;
+		updateStatus(ctx);
+		try {
+			const transcript = buildTranscriptFromSegments(state.pendingSegments);
+			const tokens = state.pendingTokens;
+			const parsed = await runObserverCall(ctx, transcript, tokens, opts.signal);
+			if (!parsed) return false;
 
-		state.pendingSegments = [];
-		state.bufferedChunks = [];
-		recomputePendingCounters(state);
+			state.observations = mergeObservationItems(state.observations, parsed.observations);
+			state.observationTokens = roughTextTokenizer(state.observations);
+			if (parsed.currentTask) state.currentTask = parsed.currentTask;
+			if (parsed.suggestedResponse) state.suggestedResponse = parsed.suggestedResponse;
+			state.observationRuns += 1;
 
-		const triggerAutoReflect = opts.triggerAutoReflect !== false;
-		if (triggerAutoReflect && shouldRunPeriodicReflection()) {
-			await reflectNow(ctx, { reason: "auto-periodic", silentIfSkipped: true });
+			state.pendingSegments = [];
+			recomputePendingCounters(state);
+
+			const triggerAutoReflect = opts.triggerAutoReflect !== false;
+			if (triggerAutoReflect && shouldRunPeriodicReflection()) {
+				await reflectNow(ctx, { reason: "auto-periodic", silentIfSkipped: true });
+			}
+
+			return true;
+		} finally {
+			state.isBufferingObservation = false;
+			updateStatus(ctx);
 		}
-
-		return true;
 	};
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1439,16 +1409,24 @@ export default function (pi: ExtensionAPI) {
 		loadState(ctx);
 	});
 
+	pi.on("session_fork", async (_event, ctx) => {
+		loadState(ctx);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		loadState(ctx);
+	});
+
 	pi.on("turn_end", async (event, ctx) => {
-		const segment: PendingSegment = {
-			id: randomId("seg"),
-			createdAt: new Date().toISOString(),
-			text: `Turn: ${JSON.stringify(event.message)}`,
-			tokens: 100,
-			buffered: false,
-		};
-		state.pendingSegments.push(segment);
-		recomputePendingCounters(state);
+		const turnMessages = [event.message, ...event.toolResults];
+		const turnLlmMessages = convertToLlm(turnMessages as any);
+		const serializedTurn = serializeConversation(turnLlmMessages);
+		const turnTokenEstimate = turnMessages.reduce((sum, msg) => sum + estimateMessageTokens(msg as any), 0);
+
+		pushPendingSegment({
+			text: `[Turn ${event.turnIndex}]\n${serializedTurn}`,
+			tokens: turnTokenEstimate,
+		});
 
 		// Auto-observe when pending tokens exceed threshold (fixes dead-lock on large context windows
 		// where compaction never triggers because the context hook trims messages before pi sees high usage)
@@ -1476,17 +1454,14 @@ export default function (pi: ExtensionAPI) {
 			const transcript = messagesToCompact
 				.map((m: any) => `${m.role}: ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`)
 				.join("\n\n");
-			state.pendingSegments.push({
+			pushPendingSegment({
 				id: randomId("compact"),
-				createdAt: new Date().toISOString(),
 				text: `[Compaction Event]\n${transcript}`,
 				tokens: roughTextTokenizer(transcript),
-				buffered: false,
 			});
-			recomputePendingCounters(state);
 
 			// Trigger observation before compaction
-			const observed = await observeNow(ctx, { triggerAutoReflect: false });
+			const observed = await observeNow(ctx, { triggerAutoReflect: false, signal: event.signal });
 			if (observed) {
 				persistState(ctx);
 				updateStatus(ctx);
@@ -1519,7 +1494,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("context", (event, ctx) => {
-		const modelHint = "";
+		const modelHint = `${ctx.model?.provider || ""}/${ctx.model?.id || ""}`;
 		const systemMessages = event.messages.filter((m: any) => m?.role === "system");
 		const nonSystemMessages = event.messages.filter((m: any) => m?.role !== "system");
 		const cleanedNonSystemMessages = nonSystemMessages.filter((m: any) => {
@@ -1610,10 +1585,10 @@ export default function (pi: ExtensionAPI) {
 				try {
 					const parsed = JSON.parse(edited);
 					const nextConfig = normalizeOmConfig(parsed);
-					saveProjectOmConfig(nextConfig);
+					const savedPath = saveProjectOmConfig(ctx.cwd, nextConfig);
 					omConfig = nextConfig;
-					activeConfigPath = PROJECT_OM_CONFIG_PATH;
-					ctx.ui.notify(`OM config saved: ${PROJECT_OM_CONFIG_PATH}`, "info");
+					activeConfigPath = savedPath;
+					ctx.ui.notify(`OM config saved: ${savedPath}`, "info");
 				} catch (error) {
 					ctx.ui.notify(`OM config invalid JSON: ${error instanceof Error ? error.message : String(error)}`, "error");
 					return;
@@ -1640,6 +1615,7 @@ export default function (pi: ExtensionAPI) {
 				`reflectEveryNObservations: ${omConfig.reflectEveryNObservations}`,
 				`reflectWhenObservationTokensOver: ${omConfig.reflectWhenObservationTokensOver}`,
 				`reflectBeforeCompaction: ${omConfig.reflectBeforeCompaction}`,
+				`autoObservePendingTokenThreshold: ${omConfig.autoObservePendingTokenThreshold}`,
 			].join("\n");
 			ctx.ui.notify(lines, "info");
 		},
@@ -1757,11 +1733,8 @@ function coerceState(raw: any): OmState {
 			createdAt: typeof s?.createdAt === "string" ? s.createdAt : new Date().toISOString(),
 			text: typeof s?.text === "string" ? s.text : "",
 			tokens: Number.isFinite(s?.tokens) ? Number(s.tokens) : 0,
-			buffered: !!s?.buffered,
 		})) : [],
 		pendingTokens: 0,
-		pendingChunks: 0,
-		bufferedChunks: [],
 		isBufferingObservation: false,
 		isBufferingReflection: false,
 	};

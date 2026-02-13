@@ -315,8 +315,9 @@ flowchart TD
   - **Use true when:** compaction boundaries should snapshot best-possible memory.
 
 - `autoObservePendingTokenThreshold`
-  - **What:** auto-observe when pending tokens exceed this threshold. Default 8000. Set 0 to disable.
-  - **Use lower when:** you want observations to stay fresh.
+  - **What:** auto-observe when pending tokens exceed this threshold. Default `8000`; set `0` to disable.
+  - **Why:** prevents deadlock where pending memory grows but compaction never triggers.
+  - **Use lower when:** you want observations to stay fresher.
   - **Use higher when:** you want fewer observer calls.
 
 #### 4) Injection strategy
