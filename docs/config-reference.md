@@ -105,6 +105,11 @@ Auto-run observer when pending segments reach this token count.
 
 ## Recommended profiles
 
+Built-in preset command:
+- `/om-config preset simple`
+- `/om-config preset balanced`
+- `/om-config preset max-memory`
+
 ### Simple (default)
 
 ```json
@@ -127,7 +132,17 @@ Auto-run observer when pending segments reach this token count.
 }
 ```
 
-### Cost-first
+### Max-memory
+
+```json
+{
+  "memoryInjectionMode": "all",
+  "recentTurnBudgetTokens": 16000,
+  "maxObservationItems": 1500
+}
+```
+
+### Cost-first (manual tuning)
 
 ```json
 {

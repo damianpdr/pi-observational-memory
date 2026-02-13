@@ -67,6 +67,7 @@ This is useful before a manual compaction or before switching topics.
 | `/om-config` | Show active config |
 | `/om-config reload` | Reload config from file |
 | `/om-config edit` | Edit config in Pi |
+| `/om-config preset <simple\|balanced\|max-memory>` | Apply preset and save project config |
 | `/om-clear` | Reset all OM state |
 
 ---
@@ -159,5 +160,3 @@ Config load order:
 ## Advanced docs
 
 - Full config reference: `docs/config-reference.md`
-
-If you want, I can also add a one-command preset switcher in `/om-config` (`simple`, `balanced`, `max-memory`).

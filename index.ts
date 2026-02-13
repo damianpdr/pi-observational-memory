@@ -235,6 +235,28 @@ type OmConfig = {
 	autoObservePendingTokenThreshold: number;
 };
 
+type OmPresetName = "simple" | "balanced" | "max-memory";
+
+const OM_PRESET_OVERRIDES: Record<OmPresetName, Partial<OmConfig>> = {
+	simple: {
+		memoryInjectionMode: "all",
+		autoObservePendingTokenThreshold: 8_000,
+		enableReflection: true,
+		reflectEveryNObservations: 3,
+	},
+	balanced: {
+		memoryInjectionMode: "core_relevant",
+		coreMemoryMaxTokens: 700,
+		relevantObservationMaxItems: 24,
+		relevantObservationMaxTokens: 1600,
+	},
+	"max-memory": {
+		memoryInjectionMode: "all",
+		recentTurnBudgetTokens: 16_000,
+		maxObservationItems: 1500,
+	},
+};
+
 const DEFAULT_OM_CONFIG: OmConfig = {
 	recentTurnBudgetTokens: 12_000,
 	maxObservationItems: 1200,
@@ -338,6 +360,21 @@ function saveProjectOmConfig(cwd: string, config: OmConfig): string {
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 	writeFileSync(projectPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 	return projectPath;
+}
+
+function normalizeOmPresetName(raw: string): OmPresetName | undefined {
+	const normalized = raw.trim().toLowerCase().replace(/[_\s]+/g, "-");
+	if (normalized === "simple") return "simple";
+	if (normalized === "balanced") return "balanced";
+	if (normalized === "max-memory" || normalized === "max") return "max-memory";
+	return undefined;
+}
+
+function applyOmPreset(current: OmConfig, preset: OmPresetName): OmConfig {
+	return normalizeOmConfig({
+		...current,
+		...OM_PRESET_OVERRIDES[preset],
+	});
 }
 
 class OmSqliteStore {
@@ -1570,37 +1607,53 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("om-config", {
-		description: "Show, reload, or edit OM config (usage: /om-config [reload|edit])",
+		description: "Show, reload, edit, or apply presets (usage: /om-config [reload|edit|preset <simple|balanced|max-memory>])",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const normalizedArgs = args.trim().toLowerCase();
+			const tokens = normalizedArgs.split(/\s+/).filter(Boolean);
 
-			if (normalizedArgs.includes("edit")) {
-				const initial = `${JSON.stringify(omConfig, null, 2)}\n`;
-				const edited = await ctx.ui.editor("Edit OM config JSON", initial);
-				if (edited === undefined) {
-					ctx.ui.notify("OM config edit cancelled.", "warning");
+			if (tokens[0] === "preset") {
+				const presetArg = tokens.slice(1).join(" ");
+				const preset = presetArg ? normalizeOmPresetName(presetArg) : undefined;
+				if (!preset) {
+					ctx.ui.notify("OM preset invalid or missing. Use: /om-config preset <simple|balanced|max-memory>", "warning");
 					return;
 				}
+				const nextConfig = applyOmPreset(omConfig, preset);
+				const savedPath = saveProjectOmConfig(ctx.cwd, nextConfig);
+				omConfig = nextConfig;
+				activeConfigPath = savedPath;
+				ctx.ui.notify(`OM preset applied: ${preset} (${savedPath})`, "info");
+			} else {
+				if (normalizedArgs.includes("edit")) {
+					const initial = `${JSON.stringify(omConfig, null, 2)}\n`;
+					const edited = await ctx.ui.editor("Edit OM config JSON", initial);
+					if (edited === undefined) {
+						ctx.ui.notify("OM config edit cancelled.", "warning");
+						return;
+					}
 
-				try {
-					const parsed = JSON.parse(edited);
-					const nextConfig = normalizeOmConfig(parsed);
-					const savedPath = saveProjectOmConfig(ctx.cwd, nextConfig);
-					omConfig = nextConfig;
-					activeConfigPath = savedPath;
-					ctx.ui.notify(`OM config saved: ${savedPath}`, "info");
-				} catch (error) {
-					ctx.ui.notify(`OM config invalid JSON: ${error instanceof Error ? error.message : String(error)}`, "error");
-					return;
+					try {
+						const parsed = JSON.parse(edited);
+						const nextConfig = normalizeOmConfig(parsed);
+						const savedPath = saveProjectOmConfig(ctx.cwd, nextConfig);
+						omConfig = nextConfig;
+						activeConfigPath = savedPath;
+						ctx.ui.notify(`OM config saved: ${savedPath}`, "info");
+					} catch (error) {
+						ctx.ui.notify(`OM config invalid JSON: ${error instanceof Error ? error.message : String(error)}`, "error");
+						return;
+					}
 				}
-			}
 
-			if (normalizedArgs.includes("reload")) {
-				reloadOmConfig(ctx, true);
+				if (normalizedArgs.includes("reload")) {
+					reloadOmConfig(ctx, true);
+				}
 			}
 
 			const lines = [
 				`Config file: ${activeConfigPath || "(none, using defaults)"}`,
+				`Presets: simple | balanced | max-memory (use: /om-config preset <name>)`,
 				`recentTurnBudgetTokens: ${omConfig.recentTurnBudgetTokens}`,
 				`maxObservationItems: ${omConfig.maxObservationItems}`,
 				`maxObserverTranscriptChars: ${omConfig.maxObserverTranscriptChars}`,
